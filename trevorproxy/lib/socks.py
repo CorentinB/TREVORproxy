@@ -26,6 +26,12 @@ class ThreadingTCPServer6(ThreadingTCPServer):
 
 class SocksProxy(StreamRequestHandler):
     def handle(self):
+        self.connection.setblocking(False)
+
+        # Set socket buffer sizes for the client socket
+        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+
         log.debug("Accepting connection from %s:%s", *self.client_address[:2])
 
         # greeting header
@@ -109,12 +115,18 @@ class SocksProxy(StreamRequestHandler):
         # reply
         try:
             if cmd == 1:  # CONNECT
+                remote = socket.socket(self.address_family, socket.SOCK_STREAM)
+                remote.setblocking(False)
+
+                # Set socket buffer sizes for the remote socket
+                remote.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+                remote.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+
                 subnet_family = (
                     socket.AF_INET
                     if self.server.proxy.subnet.version == 4
                     else socket.AF_INET6
                 )
-                remote = socket.socket(self.address_family, socket.SOCK_STREAM)
 
                 # if the IP families match, then randomize source address
                 if subnet_family == self.address_family:
@@ -216,16 +228,68 @@ class SocksProxy(StreamRequestHandler):
         )
 
     def exchange_loop(self, client, remote):
-        while 1:
-            # wait until client or remote is available for read
-            r, w, e = select.select([client, remote], [], [])
+        inputs = [client, remote]
+        outputs = []
+        client_buffer = b''
+        remote_buffer = b''
+        client_shutdown = False
+        remote_shutdown = False
 
-            if client in r:
-                data = client.recv(4096)
-                if remote.send(data) <= 0:
-                    break
+        while inputs:
+            readable, writable, exceptional = select.select(inputs, outputs, inputs)
 
-            if remote in r:
-                data = remote.recv(4096)
-                if client.send(data) <= 0:
-                    break
+            if exceptional:
+                # Handle exceptions and close connections
+                break
+
+            for sock in readable:
+                if sock is client:
+                    data = client.recv(65536)
+                    if data:
+                        remote_buffer += data
+                        if remote not in outputs:
+                            outputs.append(remote)
+                    else:
+                        # Client has closed its sending channel
+                        client_shutdown = True
+                        inputs.remove(client)
+                        # Shutdown remote's receiving channel
+                        remote.shutdown(socket.SHUT_WR)
+                elif sock is remote:
+                    data = remote.recv(65536)
+                    if data:
+                        client_buffer += data
+                        if client not in outputs:
+                            outputs.append(client)
+                    else:
+                        # Remote has closed its sending channel
+                        remote_shutdown = True
+                        inputs.remove(remote)
+                        # Shutdown client's receiving channel
+                        client.shutdown(socket.SHUT_WR)
+
+            for sock in writable:
+                if sock is client and client_buffer:
+                    sent = client.send(client_buffer)
+                    client_buffer = client_buffer[sent:]
+                    if not client_buffer:
+                        outputs.remove(client)
+                elif sock is remote and remote_buffer:
+                    sent = remote.send(remote_buffer)
+                    remote_buffer = remote_buffer[sent:]
+                    if not remote_buffer:
+                        outputs.remove(remote)
+
+            if client_shutdown and not client_buffer and client not in outputs:
+                # Client has closed, and all data sent to client
+                client.close()
+                client = None
+
+            if remote_shutdown and not remote_buffer and remote not in outputs:
+                # Remote has closed, and all data sent to remote
+                remote.close()
+                remote = None
+
+            if not client and not remote:
+                # Both connections have been closed
+                break
